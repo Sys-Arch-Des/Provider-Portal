@@ -51,7 +51,8 @@ The arrow denotes the sender and receiver of the first message. Replies travel i
 | PP-03 | Get room details | CP → PP | `rs.pp.rooms.request` · `room.get.request` | `rs.pp.rooms.response` · `room.get.response` |
 | PP-04 | Create booking | CP → PP | `rs.pp.booking.request` · `booking.create.request` | `rs.pp.booking.response` · `booking.create.response` |
 | PP-05 | Cancel booking | CP → PP | `rs.pp.booking.request` · `booking.cancel.request` | `rs.pp.booking.response` · `booking.cancel.response` |
-| PP-06 | List or look up a customer's bookings | CP → PP | `rs.pp.booking.request` · `booking.list.request` | `rs.pp.booking.response` · `booking.list.response` |
+| PP-06a | List a customer's bookings | CP → PP | `rs.pp.booking.request` · `booking.list.request` | `rs.pp.booking.response` · `booking.list.response` |
+| PP-06b | Look up an order decision | CP → PP | `rs.pp.booking.request` · `booking.lookup.request` | `rs.pp.booking.response` · `booking.lookup.response` |
 | PP-07a | Register an event favorite for suggestions | CP → PP | `rs.cp.event.favorite.request` · `event.favorite.request` | `rs.cp.event.favorite.response` · `event.favorite.response` |
 | PP-07b | Publish event suggestions | PP → CP | `rs.cp.event.notification` · `event.suggestions.published` | — |
 | PP-08 | Quote a booking before capture | CP → PP | `rs.pp.booking.request` · `booking.quote.request` | `rs.pp.booking.response` · `booking.quote.response` |
@@ -66,9 +67,18 @@ The arrow denotes the sender and receiver of the first message. Replies travel i
 
 Covers `CP-SEARCH-S01/S02/M01/M02` and `PP-SEARCH-S01/S02/M01/M02/U01/U02`.
 
-`SearchCriteria` contains `country: string` (two-letter country code), `city: string` (agreed city identifier), `checkIn: date`, `checkOut: date`, `q?: string`, `roomTypes?: RoomType[]`, `categories?: ProviderCategory[]`, and `amenities?: Amenity[]`. Require `checkOut > checkIn`. PP uses the location to route to relevant shards and limits results to rooms available for the stay. Request payload is `SearchCriteria & PageInput`.
+`SearchCriteria` contains `country: string` (two-letter country code), `city: string` (agreed city identifier), `checkIn: date`, `checkOut: date`, `adults: integer`, `children?: integer` (default 0), `rooms?: integer` (default 1), `q?: string`, `roomTypes?: RoomType[]`, `categories?: ProviderCategory[]`, and `amenities?: Amenity[]`. Require `checkOut > checkIn`, `adults >= 1`, `children >= 0`, and `1 <= rooms <= adults + children` (the `PP-BOOK-S02` rule applied at search time). PP uses the location to route to relevant shards. Request payload is `SearchCriteria & PageInput`. Invalid criteria return final `VALIDATION_ERROR`.
 
-`ProviderSummary` contains `providerId: string`, `name: string`, `logoUrl: string|null`, `city: string`, `country: string`, `category: ProviderCategory`, `roomTypes: RoomType[]`, `amenities: Amenity[]`, `availableQuantity: integer`, `minPricePerNight: Money`, `overallRating: number|null`, and `ratingCount: integer`. CP owns rating statistics. Response data contains `items: ProviderSummary[]` and `nextCursor: string|null`.
+**Guest matching.** A room listing is eligible only when all of the following hold for every night of the stay:
+
+| Rule | Meaning |
+|---|---|
+| `availableQuantity >= rooms` | Enough free units of that listing. |
+| `rooms × capacity >= adults + children` | The requested units can sleep every guest. `capacity` is guests per unit. |
+
+Guest matching applies to one listing at a time; PP does not mix room types to fit a party. CP searches again with a different `rooms` value to offer other combinations.
+
+`ProviderSummary` contains `providerId: string`, `name: string`, `logoUrl: string|null`, `city: string`, `country: string`, `category: ProviderCategory`, `roomTypes: RoomType[]`, `amenities: Amenity[]`, `availableQuantity: integer`, `minPricePerNight: Money`, `overallRating: number|null`, and `ratingCount: integer`. `roomTypes`, `amenities`, `availableQuantity` (sum of free units) and `minPricePerNight` (lowest base nightly rate) describe only the provider's eligible listings. CP owns rating statistics. Response data contains `items: ProviderSummary[]` and `nextCursor: string|null`. Results are ordered by relevance, then `overallRating` descending, then `providerId`.
 
 **CP decision D3.** Proposed matching keeps location and availability mandatory. Within a supplied filter group, any selected value can match. Across supplied groups and text criteria, require every supplied group to match the same eligible listing and its provider. The SRS describes OR semantics and gives an example that combines criteria. Confirm which groups should combine by OR, the searchable fields, and these expected results before implementation. For the example `Single Bed Free WiFi Homestay`, the proposed expected set is Homestay providers with an available Single/Twin room offering Free Wi-Fi. A Homestay offering only Double Bed fails that example. Agree text parsing, the seven-value amenity vocabulary, city identifiers, availability aggregation, and deterministic pagination ordering.
 
@@ -84,6 +94,9 @@ Covers `CP-SEARCH-S01/S02/M01/M02` and `PP-SEARCH-S01/S02/M01/M02/U01/U02`.
     "city": "hcmc",
     "checkIn": "2027-01-10",
     "checkOut": "2027-01-12",
+    "adults": 2,
+    "children": 0,
+    "rooms": 1,
     "q": "Example",
     "roomTypes": [
       "SINGLE_TWIN_BED"
@@ -136,9 +149,9 @@ Covers `CP-SEARCH-S01/S02/M01/M02` and `PP-SEARCH-S01/S02/M01/M02/U01/U02`.
 
 ### PP-02 · List a provider's available rooms
 
-Covers `CP-SEARCH-S03` and `PP-SEARCH-S03`. Request contains `providerId: string` and `criteria: SearchCriteria`. CP passes the selected search criteria without the cursor. PP applies the same matching rules so that branches outside the selected city and unrelated rooms do not enter the result. Error `PROVIDER_NOT_FOUND` is final.
+Covers `CP-SEARCH-S03`, `PP-SEARCH-S03` and `PP-ROOM-U02`. Request contains `providerId: string` and `criteria: SearchCriteria`. CP passes the same criteria it used for PP-01, including the guest counts, without the cursor. PP applies the same matching and guest rules so that branches outside the selected city, rooms that are full, and rooms too small for the party do not enter the result. Error `PROVIDER_NOT_FOUND` is final.
 
-`RoomListing` contains `roomId: string`, `branchId: string`, `name: string`, `roomType: RoomType`, `availableQuantity: integer`, `pricePerNight: Money`, `images: string[]`, and `amenities: Amenity[]`. The price is the base nightly rate. The customer-specific payable price comes from PP-08. Response data contains `provider: ProviderSummary` and `rooms: RoomListing[]`.
+`RoomListing` contains `roomId: string`, `branchId: string`, `name: string`, `roomType: RoomType`, `capacity: integer` (guests per unit), `availableQuantity: integer`, `pricePerNight: Money`, `images: string[]`, and `amenities: Amenity[]`. The price is the base nightly rate. The customer-specific payable price comes from PP-08. Response data contains `provider: ProviderSummary` and `rooms: RoomListing[]`.
 
 ```json
 {
@@ -154,6 +167,9 @@ Covers `CP-SEARCH-S03` and `PP-SEARCH-S03`. Request contains `providerId: string
       "city": "hcmc",
       "checkIn": "2027-01-10",
       "checkOut": "2027-01-12",
+      "adults": 2,
+      "children": 0,
+      "rooms": 1,
       "q": "Example",
       "roomTypes": [
         "SINGLE_TWIN_BED"
@@ -202,6 +218,7 @@ Covers `CP-SEARCH-S03` and `PP-SEARCH-S03`. Request contains `providerId: string
           "branchId": "br-1",
           "name": "Twin Room",
           "roomType": "SINGLE_TWIN_BED",
+          "capacity": 2,
           "availableQuantity": 5,
           "pricePerNight": {
             "amount": 8500,
@@ -222,7 +239,7 @@ Covers `CP-SEARCH-S03` and `PP-SEARCH-S03`. Request contains `providerId: string
 
 ### PP-03 · Get room details
 
-Covers `CP-SEARCH-S03` and `PP-SEARCH-S02/S03`. Request contains `roomId: string`, `checkIn: date`, and `checkOut: date`. Response data is `RoomListing` with `description: string`, `capacity: integer`, and `branchAddress: string`. Missing or archived rooms return final `ROOM_NOT_FOUND`. A live listing with no inventory for the dates returns `availableQuantity: 0`.
+Covers `CP-SEARCH-S03`, `PP-SEARCH-S02/S03` and `PP-ROOM-U02`. Request contains `roomId: string`, `checkIn: date`, and `checkOut: date`. Require `checkOut > checkIn`. Response data is `RoomListing` plus `description: string` and `branchAddress: string`. `availableQuantity` is the smallest number of free units across the nights of the stay. Missing or archived rooms return final `ROOM_NOT_FOUND`. A live listing with no inventory for the dates returns `availableQuantity: 0`.
 
 ```json
 {
@@ -252,6 +269,7 @@ Covers `CP-SEARCH-S03` and `PP-SEARCH-S02/S03`. Request contains `roomId: string
       "branchId": "br-1",
       "name": "Twin Room",
       "roomType": "SINGLE_TWIN_BED",
+      "capacity": 2,
       "availableQuantity": 5,
       "pricePerNight": {
         "amount": 8500,
@@ -264,7 +282,6 @@ Covers `CP-SEARCH-S03` and `PP-SEARCH-S02/S03`. Request contains `roomId: string
         "FREE_WIFI"
       ],
       "description": "Twin beds with Wi-Fi",
-      "capacity": 2,
       "branchAddress": "Example Street, Ho Chi Minh City"
     }
   }
@@ -284,17 +301,41 @@ Covers `PP-BOOK-S01/S02/U01`, `PP-MONEY-U01` and `CP-MONEY-U01–U04`. CP author
 | Approve | The receptionist approves the provider's own pending booking. PP moves it to `APPROVED` with `RELEASE_PENDING` and initiates one release. PP reports `RELEASED` or `RELEASE_FAILED`. Proposed confirmation email trigger is the first outcome showing approval or completion with `RELEASED`. |
 | Cancel | An authorized customer uses PP-05 or the receptionist cancels in PP. PP releases inventory once and reports cancellation with `REFUND_PENDING`, then `REFUNDED` or `REFUND_FAILED`. If release is in flight, PP reconciles it before executing the return. If release already succeeded, the return follows the agreed sandbox recovery path. |
 | Reject after capture | For a definitive PP-04 rejection with no accepted booking, CP verifies that the capture belongs to the rejected order and is unbound to any accepted booking. CP owns returning that capture and reporting the result to its customer. PP owns refunds for accepted bookings. |
-| Timeout after capture | CP keeps the same order and capture identifiers and resends the same command. CP may use PP-06 with `orderId` to reconcile. An empty lookup alone does not establish rejection. CP uses the recorded order decision or keeps the order pending reconciliation. |
+| Timeout after capture | CP keeps the same order and capture identifiers and resends the same command. CP may use PP-06b with `orderId` to reconcile. An empty lookup alone does not establish rejection. CP uses the recorded order decision or keeps the order pending reconciliation. |
 
 ### Booking retry and concurrency rules
 
-**CP decision D5.** CP generates `orderId` for one purchase and `cancellationId` for one cancellation command. PP scopes these IDs to the CP partner and binds them to immutable request data. A matching replay returns the stored command result. A different payload under the same ID returns final `IDEMPOTENCY_CONFLICT`. A capture reference already bound to another order returns final `CAPTURE_ALREADY_USED`. That error requires reconciliation with the existing order before any refund. Before evaluating current quote expiry or stock on a replay, PP checks the stored decision. A retry of a successful booking can therefore return the original acceptance after the quote expires. PP-06 and CP-01 expose subsequent state.
+**CP decision D5.** CP generates `orderId` for one purchase and `cancellationId` for one cancellation command. PP scopes these IDs to the CP partner and binds them to immutable request data. A matching replay returns the stored command result. A different payload under the same ID returns final `IDEMPOTENCY_CONFLICT`. A capture reference already bound to another order returns final `CAPTURE_ALREADY_USED`. That error requires reconciliation with the existing order before any refund. Before evaluating current quote expiry or stock on a replay, PP checks the stored decision. A retry of a successful booking can therefore return the original acceptance after the quote expires. PP-06a, PP-06b and CP-01 expose subsequent state.
+
+### Booking error codes
+
+All codes below are final (`retryable: false`) except `TEMPORARILY_UNAVAILABLE`.
+
+| Code | Returned by | Meaning |
+|---|---|---|
+| `VALIDATION_ERROR` | All | Missing field, bad date range, or negative count. |
+| `ROOM_NOT_FOUND` | PP-08, PP-04 | Room is missing, archived, or not active. |
+| `ROOM_NOT_AVAILABLE` | PP-08, PP-04 | Not enough free units for every night. |
+| `QUANTITY_EXCEEDS_GUESTS` | PP-08, PP-04 | `quantity > adults + children` (`PP-BOOK-S02`). |
+| `GUESTS_EXCEED_CAPACITY` | PP-08, PP-04 | `quantity × capacity < adults + children`. |
+| `CUSTOMER_NOT_FOUND` | PP-08 | CP-04 does not know the customer. |
+| `QUOTE_NOT_FOUND` | PP-04 | Unknown `quoteId`. |
+| `QUOTE_EXPIRED` | PP-04 | Quote expired before the first acceptance. |
+| `QUOTE_MISMATCH` | PP-04 | Customer, room, dates, quantity, guest counts or membership differ from the quote. |
+| `QUOTE_ALREADY_USED` | PP-04 | Quote is bound to another `orderId`. |
+| `PAYMENT_MISMATCH` | PP-04 | Capture amount, currency or held status does not match. |
+| `CAPTURE_ALREADY_USED` | PP-04 | Capture is bound to another order. |
+| `IDEMPOTENCY_CONFLICT` | PP-04, PP-05 | Same `orderId` or `cancellationId` with a different payload. |
+| `BOOKING_NOT_FOUND` | PP-05 | Unknown `bookingId`, or one the customer cannot see. |
+| `NOT_BOOKING_OWNER` | PP-05 | Booking belongs to another customer. |
+| `BOOKING_NOT_CANCELLABLE` | PP-05 | Already cancelled, completed, or past the cutoff (D7). |
+| `TEMPORARILY_UNAVAILABLE` | All | Sandbox, CP-04 or a dependency is down. Retryable (D1). |
 
 All PP booking instances use the same authoritative inventory and order decisions. For create, reserve inventory and record the accepted order as one atomic change. Persist definitive rejections for valid identified commands so the same order cannot later succeed after CP starts a refund. A conflicting replay leaves the original order decision intact. Serialize approval and cancellation for a given booking. Use a stable payment operation ID for each release or refund and reconcile its outcome before retrying an uncertain gateway call. Retain order decisions through the agreed reconciliation period. Confirm the retry deadline, decision retention, and ownership of unresolved outcomes.
 
 ### PP-08 · Quote a booking before capture
 
-Covers `PP-DISCOUNT-S01/S02` and supports `PP-MONEY-U01`. Request contains `customerId: string`, `roomId: string`, `checkIn: date`, `checkOut: date`, `quantity: integer`, `adults: integer`, and `children: integer`. Require a positive quantity, non-negative guest counts, and `quantity <= adults + children`. PP checks membership through CP-04 and verifies availability. Response data contains `quoteId: string`, `expiresAt: timestamp`, `membership: Membership`, `discountPolicyId: string|null`, and `totalAmount: Money`.
+Covers `PP-DISCOUNT-S01/S02` and supports `PP-MONEY-U01`. Request contains `customerId: string`, `roomId: string`, `checkIn: date`, `checkOut: date`, `quantity: integer`, `adults: integer`, and `children: integer`. Require `checkOut > checkIn`, `quantity >= 1`, `adults >= 1`, `children >= 0`, `quantity <= adults + children`, and `quantity × capacity >= adults + children` (the same guest rules as PP-01). PP checks membership through CP-04 and verifies availability. Response data contains `quoteId: string`, `expiresAt: timestamp`, `membership: Membership`, `discountPolicyId: string|null`, `subtotalAmount: Money` (base price × nights × quantity), `discountAmount: Money`, and `totalAmount: Money` (subtotal minus discount). Errors are listed in **Booking error codes**.
 
 **CP decision D6.** The proposed quote locks pricing until expiry and does not reserve inventory. PP applies the assigned percentage discount to the stay subtotal for customers with active Premium at quote time. CP captures the quoted amount. PP verifies that an initial acceptance uses an unexpired quote bound to the submitted customer, room, dates, quantity, and guest counts. An accepted booking retains the quoted amount if prices or discount policies later change. Confirm quote lifetime, rounding, membership cutoff, and the effect of policy cancellation on open quotes. A definitive `QUOTE_EXPIRED` or `ROOM_NOT_AVAILABLE` after capture follows the recovery rule above.
 
@@ -330,6 +371,14 @@ Covers `PP-DISCOUNT-S01/S02` and supports `PP-MONEY-U01`. Request contains `cust
       "expiresAt": "2026-11-20T04:13:01Z",
       "membership": "PREMIUM",
       "discountPolicyId": "d-1",
+      "subtotalAmount": {
+        "amount": 17000,
+        "currency": "USD"
+      },
+      "discountAmount": {
+        "amount": 1700,
+        "currency": "USD"
+      },
       "totalAmount": {
         "amount": 15300,
         "currency": "USD"
@@ -341,7 +390,7 @@ Covers `PP-DISCOUNT-S01/S02` and supports `PP-MONEY-U01`. Request contains `cust
 
 ### PP-04 · Create booking
 
-Request contains `orderId: string`, `quoteId: string`, `customerId: string`, `customerName: string`, `customerEmail: string`, `membership: Membership`, `roomId: string`, `checkIn: date`, `checkOut: date`, `quantity: integer`, `adults: integer`, `children: integer`, `totalAmount: Money`, and `captureReference: string`. PP validates the supplied membership and amount against the quote. Through the sandbox integration, PP verifies the capture's held status, amount, currency, and binding to the submitted order. Final errors include `QUANTITY_EXCEEDS_GUESTS`, `ROOM_NOT_AVAILABLE`, `QUOTE_EXPIRED`, and `PAYMENT_MISMATCH`. If verification is temporarily unavailable, keep the result retryable until PP establishes the capture status.
+Request contains `orderId: string`, `quoteId: string`, `customerId: string`, `customerName: string`, `customerEmail: string`, `membership: Membership`, `roomId: string`, `checkIn: date`, `checkOut: date`, `quantity: integer`, `adults: integer`, `children: integer`, `totalAmount: Money`, and `captureReference: string`. PP validates the supplied membership and amount against the quote. Through the sandbox integration, PP verifies the capture's held status, amount, currency, and binding to the submitted order. PP re-checks availability at decision time, because the quote does not hold rooms. Errors are listed in **Booking error codes**. If verification is temporarily unavailable, return `TEMPORARILY_UNAVAILABLE` until PP establishes the capture status.
 
 Response data contains `orderId: string`, `bookingId: string`, `providerId: string`, `version: integer`, `status: BookingStatus`, `checkIn: date`, `checkOut: date`, and `payment: Payment`. The initial accepted result has version 1 and uses `PENDING` and `CAPTURED_HELD`.
 
@@ -494,24 +543,24 @@ Request contains `cancellationId: string`, `bookingId: string`, `customerId: str
 }
 ```
 
-### PP-06 · List or look up a customer's bookings
+### PP-06a · List a customer's bookings
 
-Request contains `customerId: string`, `orderId?: string`, and `PageInput`. If `orderId` is supplied, omit pagination inputs. Response data contains `items: BookingSummary[]`, `nextCursor: string|null`, and `orderDecision?: OrderDecision`. Return `orderDecision` only on an order lookup. Its fields are `status: ACCEPTED|REJECTED|UNKNOWN` and `error?: Error` (required on `REJECTED`). A lookup is scoped to the supplied customer. `UNKNOWN` means PP has no definitive visible decision for that customer and order. A mismatched customer must not be shown the existence or state of someone else's booking.
+Covers `PP-BOOK-S01` (booking records and review eligibility). Request contains `customerId: string`, `statuses?: BookingStatus[]`, and `PageInput`. Response data contains `items: BookingSummary[]` and `nextCursor: string|null`. Items are ordered by `checkIn` descending, then `bookingId`. Only the supplied customer's bookings are returned. An unknown customer returns an empty list.
 
-`BookingSummary` contains `bookingId: string`, `orderId: string`, `providerId: string`, `providerName: string`, `roomId: string`, `roomName: string`, `checkIn: date`, `checkOut: date`, `quantity: integer`, `version: integer`, `status: BookingStatus`, `totalAmount: Money`, `payment: Payment`, and `reviewEligibleFrom: timestamp|null`. `COMPLETED` represents a completed stay. Payment release is represented independently.
+`BookingSummary` contains `bookingId: string`, `orderId: string`, `providerId: string`, `providerName: string`, `branchAddress: string`, `roomId: string`, `roomName: string`, `checkIn: date`, `checkOut: date`, `quantity: integer`, `adults: integer`, `children: integer`, `version: integer`, `status: BookingStatus`, `totalAmount: Money`, `payment: Payment`, and `reviewEligibleFrom: timestamp|null`. `COMPLETED` represents a completed stay. Payment release is represented independently.
 
 **CP decision D8.** Proposed review eligibility begins on the first local day of a qualifying approved or completed stay, after successful escrow release. Pending or cancelled bookings return null. PP supplies evidence for the accommodation provider review. CP checks the current time and owns review state and the Pending & Active, Not Reviewed, and Past groupings. Confirm the booking states, treatment of cancellation after check-in, and which property timezone determines the first day.
 
 ```json
 {
   "messageId": "m-15",
-  "correlationId": "lookup-1",
+  "correlationId": "list-1",
   "type": "booking.list.request",
   "timestamp": "2026-11-20T04:04:06Z",
   "attempt": 1,
   "payload": {
     "customerId": "c-9",
-    "orderId": "o-1"
+    "limit": 10
   }
 }
 ```
@@ -519,7 +568,7 @@ Request contains `customerId: string`, `orderId?: string`, and `PageInput`. If `
 ```json
 {
   "messageId": "m-16",
-  "correlationId": "lookup-1",
+  "correlationId": "list-1",
   "type": "booking.list.response",
   "timestamp": "2026-11-20T04:04:07Z",
   "attempt": 1,
@@ -531,11 +580,14 @@ Request contains `customerId: string`, `orderId?: string`, and `PageInput`. If `
           "orderId": "o-1",
           "providerId": "p-1",
           "providerName": "Example Hotel",
+          "branchAddress": "Example Street, Ho Chi Minh City",
           "roomId": "r-3",
           "roomName": "Twin Room",
           "checkIn": "2027-01-10",
           "checkOut": "2027-01-12",
           "quantity": 1,
+          "adults": 2,
+          "children": 0,
           "version": 1,
           "status": "PENDING",
           "totalAmount": {
@@ -551,10 +603,77 @@ Request contains `customerId: string`, `orderId?: string`, and `PageInput`. If `
           "reviewEligibleFrom": null
         }
       ],
-      "nextCursor": null,
-      "orderDecision": {
-        "status": "ACCEPTED"
-      }
+      "nextCursor": null
+    }
+  }
+}
+```
+
+### PP-06b · Look up an order decision
+
+Covers `PP-BOOK-U01` recovery and the timeout rule in §4. CP uses it after a PP-04 timeout to learn what PP decided for one `orderId`. Request contains `customerId: string` and `orderId: string`. Response data contains `orderId: string`, `decision: ACCEPTED|REJECTED|UNKNOWN`, `booking: BookingSummary|null`, and `error: Error|null`.
+
+| `decision` | `booking` | `error` | Meaning |
+|---|---|---|---|
+| `ACCEPTED` | Current snapshot | null | PP accepted the order. Apply the snapshot if its `version` is newer. |
+| `REJECTED` | null | The stored final error | PP definitively rejected the order. CP follows "Reject after capture". |
+| `UNKNOWN` | null | null | PP has no decision visible to this customer. This does **not** mean rejection; CP resends PP-04 or keeps the order pending. |
+
+The lookup is scoped to the supplied customer. A mismatched customer gets `UNKNOWN`, never the existence or state of someone else's booking.
+
+```json
+{
+  "messageId": "m-15b",
+  "correlationId": "lookup-1",
+  "type": "booking.lookup.request",
+  "timestamp": "2026-11-20T04:04:06Z",
+  "attempt": 1,
+  "payload": {
+    "customerId": "c-9",
+    "orderId": "o-1"
+  }
+}
+```
+
+```json
+{
+  "messageId": "m-16b",
+  "correlationId": "lookup-1",
+  "type": "booking.lookup.response",
+  "timestamp": "2026-11-20T04:04:07Z",
+  "attempt": 1,
+  "payload": {
+    "data": {
+      "orderId": "o-1",
+      "decision": "ACCEPTED",
+      "booking": {
+        "bookingId": "b-1",
+        "orderId": "o-1",
+        "providerId": "p-1",
+        "providerName": "Example Hotel",
+        "branchAddress": "Example Street, Ho Chi Minh City",
+        "roomId": "r-3",
+        "roomName": "Twin Room",
+        "checkIn": "2027-01-10",
+        "checkOut": "2027-01-12",
+        "quantity": 1,
+        "adults": 2,
+        "children": 0,
+        "version": 1,
+        "status": "PENDING",
+        "totalAmount": {
+          "amount": 15300,
+          "currency": "USD"
+        },
+        "payment": {
+          "status": "CAPTURED_HELD",
+          "captureReference": "cap-1",
+          "releaseReference": null,
+          "refundReference": null
+        },
+        "reviewEligibleFrom": null
+      },
+      "error": null
     }
   }
 }
@@ -562,7 +681,7 @@ Request contains `customerId: string`, `orderId?: string`, and `PageInput`. If `
 
 ### CP-01 · Booking outcome event
 
-PP publishes after committing each subsequent booking or payment change. Payload contains `bookingId: string`, `orderId: string`, `customerId: string`, `version: integer`, `status: BookingStatus`, `payment: Payment`, and `updatedAt: timestamp`. Each event is a snapshot. PP uses `bookingId` as the Kafka key and increments `version` per committed change. CP applies only a snapshot newer than the last applied version for that booking, regardless of whether it came from a reply or an event. Process confirmation email eligibility once per booking from a qualifying outcome, even if a reply with the same version arrived first. Suppress an obsolete confirmation if CP already knows the booking is cancelled. CP uses PP-06 for reconciliation. **CP decision D5** covers reliable publication after commit and idempotent consumer processing.
+PP publishes after committing each subsequent booking or payment change. Payload contains `bookingId: string`, `orderId: string`, `customerId: string`, `version: integer`, `status: BookingStatus`, `payment: Payment`, and `updatedAt: timestamp`. Each event is a snapshot. PP uses `bookingId` as the Kafka key and increments `version` per committed change. CP applies only a snapshot newer than the last applied version for that booking, regardless of whether it came from a reply or an event. Process confirmation email eligibility once per booking from a qualifying outcome, even if a reply with the same version arrived first. Suppress an obsolete confirmation if CP already knows the booking is cancelled. CP uses PP-06a or PP-06b for reconciliation. **CP decision D5** covers reliable publication after commit and idempotent consumer processing.
 
 Approval and successful release, followed later by successful cancellation and refund, are shown below. Intermediate pending outcomes use the same schema.
 
